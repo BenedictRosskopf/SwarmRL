@@ -58,6 +58,13 @@ class SubdividedVisionCones(Observable):
         self.radii = radii
         self.detected_types = detected_types
         self.angle_fn = jit(calc_signed_angle_between_directors)
+        
+        # Calculate observable shape (stored in _shape for the property)
+        if detected_types is not None:
+            self._shape = (n_cones, len(detected_types))
+        else:
+            # Will be determined dynamically during first compute
+            self._shape = None
 
     def _detect_all_things_to_see(self, colloids: List[Colloid]):
         """
@@ -79,6 +86,8 @@ class SubdividedVisionCones(Observable):
             if c.type not in all_types:
                 all_types.append(c.type)
         self.detected_types = np.array(np.sort(all_types))
+        # Update observable shape now that types are determined
+        self._shape = (self.n_cones, len(self.detected_types))
 
     @partial(jit, static_argnums=(0,))
     def _calculate_cones_single_object(

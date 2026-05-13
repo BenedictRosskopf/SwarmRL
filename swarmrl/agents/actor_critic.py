@@ -221,7 +221,7 @@ class ActorCriticAgent(Agent):
             )
 
         rewards += external_reward
-        if self.train:
-            self.trajectory.rewards.append(rewards)
+        # if self.train:
+        #     self.trajectory.rewards.append(rewards)
         self.kill_switch = self.task.kill_switch
         return rewards

@@ -1397,6 +1397,35 @@ class EspressoMD(Engine):
                             rotation_axis = [0, 0, round(rotation_axis[2])]
                             coll.rotate(axis=rotation_axis, angle=rotation_angle)
 
+                if action.pair_potential_enabled is not None:
+                    self._apply_pair_potential(action.pair_potential_enabled)
+
+    def _apply_pair_potential(self, enabled: bool):
+        """Toggle Lennard-Jones pair potential between all colloids"""
+        # Loop through all particle type pairs
+        for type_0, prop_dict_0 in self.colloid_radius_register.items():
+            for type_1, prop_dict_1 in self.colloid_radius_register.items():
+                if type_0 > type_1:
+                    continue
+                
+                if enabled:
+                    # Add LJ potential
+                    sigma = (prop_dict_0["radius"] + prop_dict_1["radius"]) * 2 ** (-1/6)
+                    self.system.non_bonded_inter[type_0, type_1].lennard_jones.set_params(
+                        sigma=sigma,
+                        epsilon=self.params.WCA_epsilon.m_as("sim_energy"),  # Same scale as WCA
+                        cutoff=2.5 * sigma,
+                        shift="auto",
+                    )
+                else:
+                    # Remove LJ potential
+                    self.system.non_bonded_inter[type_0, type_1].lennard_jones.set_params(
+                        sigma=0,
+                        epsilon=0,
+                        cutoff=0,
+                        shift="auto",
+                    )
+
     def integrate(self, n_slices, force_model: ForceFunction = None):
         """
         Integrate the system for n_slices steps.
