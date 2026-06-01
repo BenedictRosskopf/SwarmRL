@@ -22,6 +22,7 @@ try:
     import espressomd.constraints
     import espressomd.lb
     import espressomd.shapes
+    from espressomd.interactions import AngleHarmonic
 except ModuleNotFoundError:
     logger.warning("Could not find espressomd. Features will not be available")
 
@@ -1400,6 +1401,9 @@ class EspressoMD(Engine):
                 if action.pair_potential_enabled is not None:
                     self._apply_pair_potential(action.pair_potential_enabled)
 
+                if action.angle_potential_enabled is not None:
+                    self._apply_angle_potential(action.angle_potential_enabled)
+
     def _apply_pair_potential(self, enabled: bool):
         """Toggle Lennard-Jones pair potential between all colloids"""
         # Loop through all particle type pairs
@@ -1425,6 +1429,110 @@ class EspressoMD(Engine):
                         cutoff=0,
                         shift="auto",
                     )
+
+    def _apply_angle_potential(self, enabled: bool):
+        """
+        Toggle angle potential between neighboring particles.
+        
+        When enabled, creates harmonic angle bonds between triplets of particles
+        that are close to each other, encouraging them to form extended or bent shapes.
+        When disabled, removes all angle bonds.
+        
+        Parameters
+        ----------
+        enabled : bool
+            If True, create angle bonds between nearby particle triplets.
+            If False, remove all angle bonds.
+        """
+        if enabled:
+            self._create_angle_bonds()
+        else:
+            self._remove_all_angle_bonds()
+
+    def _create_angle_bonds(self):
+        """
+        Create harmonic angle bonds between triplets of nearby same-type particles.
+
+        For each particle of each type, find the two nearest neighbors *of the same
+        type* within `distance_threshold` and add a harmonic angle bond at the hub.
+        Restricting to same-type triplets matters: a triplet that mixes radii (e.g.
+        small agents + large cargo) has no reachable 90° geometry, so the harmonic
+        restoring torque diverges and the integrator overflows the image box.
+        """
+        if not hasattr(self, 'active_angle_bonds'):
+            self.active_angle_bonds = set()
+
+        # Parameters for angle bond creation
+        distance_threshold = 2.5  # Max separation (sim_length) for neighbor detection
+        k_angle = 10.0            # Spring constant for angle potential
+        phi_0 = np.pi / 2         # Equilibrium angle 90° (for V-shapes)
+
+        # Group colloids by type so that bonds only form within a type.
+        by_type: dict = {}
+        for col in self.colloids:
+            by_type.setdefault(col.type, []).append(col)
+
+        for type_members in by_type.values():
+            if len(type_members) < 3:
+                continue
+
+            for i, hub in enumerate(type_members):
+                pos_i = hub.pos
+                distances = []
+                for j, candidate in enumerate(type_members):
+                    if i == j:
+                        continue
+                    dist = np.linalg.norm(pos_i - candidate.pos)
+                    if dist < distance_threshold:
+                        distances.append((dist, j))
+
+                distances.sort()
+                if len(distances) < 2:
+                    continue
+
+                _, idx_1 = distances[0]
+                _, idx_2 = distances[1]
+                neighbor_1 = type_members[idx_1]
+                neighbor_2 = type_members[idx_2]
+
+                bond_tuple = tuple(sorted([neighbor_1.id, hub.id, neighbor_2.id]))
+
+                if bond_tuple in self.active_angle_bonds:
+                    continue
+
+                try:
+                    angle_bond = AngleHarmonic(bend=k_angle, phi0=phi_0)
+                    self.system.bonded_inter.add(angle_bond)
+                    neighbor_1.add_bond((angle_bond, hub.id, neighbor_2.id))
+                    self.active_angle_bonds.add(bond_tuple)
+                    logger.debug(
+                        f"Created angle bond: {neighbor_1.id}-{hub.id}-{neighbor_2.id}"
+                    )
+                except Exception as e:
+                    logger.warning(f"Failed to create angle bond: {e}")
+
+    def _remove_all_angle_bonds(self):
+        """
+        Remove all active angle bonds from the system.
+
+        Detaches bond references from each particle individually instead of calling
+        `system.bonded_inter.clear()`: clearing the global registry leaves stale
+        references on particles and the next add gets an id whose lookup via
+        `bonded_inter[len-1]` fails ("bond with id 0 is not yet defined").
+        """
+        if not hasattr(self, 'active_angle_bonds'):
+            self.active_angle_bonds = set()
+
+        try:
+            # `particle.bonds = []` triggers the property setter, which internally
+            # calls delete_all_bonds. Iterating delete_bond on a live list is
+            # unreliable since the list shrinks during iteration.
+            for col in self.colloids:
+                col.bonds = []
+            self.active_angle_bonds.clear()
+            logger.debug("Removed all angle bonds from particles")
+        except Exception as e:
+            logger.warning(f"Failed to remove angle bonds: {e}")
 
     def integrate(self, n_slices, force_model: ForceFunction = None):
         """

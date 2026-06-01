@@ -18,3 +18,4 @@ class Action:
     torque: np.ndarray = None
     new_direction: np.ndarray = None
     pair_potential_enabled: bool = None
+    angle_potential_enabled: bool = None
