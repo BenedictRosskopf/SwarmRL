@@ -204,6 +204,18 @@ class EspressoMD(Engine):
         # after the first call to integrate, no more changes to the engine are allowed
         self.integration_initialised = False
 
+        # Current GLOBAL pair/angle potential state, so manage_forces can toggle
+        # them at most once per slice instead of once per agent. Ground truth at
+        # construction is "off": no LJ params set, no angle bonds attached.
+        self._pair_potential_on = False
+        self._angle_potential_on = False
+
+        # Formation (LJ pair + harmonic angle) binds agents into shapes, so it must act
+        # only between agents (the agent particle type), never agent<->cargo or
+        # cargo<->cargo. An attractive agent<->cargo tail would pull agents into the
+        # cargo. Agents are type 0 throughout this project; override if that changes.
+        self.formation_type = 0
+
         espressomd.assert_features([
             "ROTATION",
             "EXTERNAL_FORCES",
@@ -1222,6 +1234,8 @@ class EspressoMD(Engine):
             "Unwrapped_Positions": list(),
             "Velocities": list(),
             "Directors": list(),
+            "Pair_Potential_Active": list(),
+            "Angle_Potential_Active": list(),
         }
 
         n_colloids = len(self.colloids)
@@ -1254,6 +1268,14 @@ class EspressoMD(Engine):
                     dtype=float,
                     **dataset_kwargs,
                 )
+            for name in ["Pair_Potential_Active", "Angle_Potential_Active"]:
+                part_group.require_dataset(
+                    name,
+                    shape=(traj_len, 1, 1),
+                    maxshape=(None, 1, 1),
+                    dtype=int,
+                    **dataset_kwargs,
+                )
         self.write_idx = 0
         self.h5_time_steps_written = 0
 
@@ -1277,6 +1299,12 @@ class EspressoMD(Engine):
         )
         self.traj_holder["Directors"].append(
             np.stack([c.director for c in self.colloids], axis=0)
+        )
+        self.traj_holder["Pair_Potential_Active"].append(
+            np.array([[int(self._pair_potential_on)]])
+        )
+        self.traj_holder["Angle_Potential_Active"].append(
+            np.array([[int(self._angle_potential_on)]])
         )
 
     def _write_traj_chunk_to_file(self):
@@ -1398,37 +1426,82 @@ class EspressoMD(Engine):
                             rotation_axis = [0, 0, round(rotation_axis[2])]
                             coll.rotate(axis=rotation_axis, angle=rotation_angle)
 
-                if action.pair_potential_enabled is not None:
-                    self._apply_pair_potential(action.pair_potential_enabled)
+            # Pair/angle potentials are GLOBAL state, so apply them at most once per
+            # slice instead of once per agent. Doing it per-agent re-tuned ESPResSo's
+            # cell system up to n_colloids times per slice and thrashed angle-bond
+            # create/remove whenever agents disagreed within the same slice.
+            self._apply_potential_toggles(actions)
 
-                if action.angle_potential_enabled is not None:
-                    self._apply_angle_potential(action.angle_potential_enabled)
+    def _apply_potential_toggles(self, actions):
+        """Apply the global pair/angle potentials once for the whole slice.
+
+        Each action may carry pair_potential_enabled / angle_potential_enabled, or
+        None to express no preference. Because the underlying ESPResSo state is
+        global, the per-agent flags are collapsed into a single desired state with
+        an "any agent requesting on -> on" rule.
+        """
+        pair_requests = [
+            a.pair_potential_enabled
+            for a in actions
+            if a.pair_potential_enabled is not None
+        ]
+        if pair_requests:
+            desired_pair = any(pair_requests)
+            # LJ params are geometry-independent, so only re-set on a state flip;
+            # re-setting every slice would needlessly re-tune the Verlet/cell lists.
+            if desired_pair != self._pair_potential_on:
+                self._apply_pair_potential(desired_pair)
+                self._pair_potential_on = desired_pair
+
+        angle_requests = [
+            a.angle_potential_enabled
+            for a in actions
+            if a.angle_potential_enabled is not None
+        ]
+        if angle_requests:
+            desired_angle = any(angle_requests)
+            if desired_angle:
+                # Triplet geometry changes as particles move, so re-evaluate the
+                # bonds each slice while on (cheap now that a single shared bond
+                # instance is reused). _create_angle_bonds dedups via
+                # active_angle_bonds, so steady state only attaches new triplets.
+                self._apply_angle_potential(True)
+                self._angle_potential_on = True
+            elif self._angle_potential_on:
+                self._apply_angle_potential(False)
+                self._angle_potential_on = False
 
     def _apply_pair_potential(self, enabled: bool):
-        """Toggle Lennard-Jones pair potential between all colloids"""
-        # Loop through all particle type pairs
-        for type_0, prop_dict_0 in self.colloid_radius_register.items():
-            for type_1, prop_dict_1 in self.colloid_radius_register.items():
-                if type_0 > type_1:
-                    continue
-                
-                if enabled:
-                    # Add LJ potential
-                    sigma = (prop_dict_0["radius"] + prop_dict_1["radius"]) * 2 ** (-1/6)
-                    self.system.non_bonded_inter[type_0, type_1].lennard_jones.set_params(
-                        sigma=sigma,
-                        epsilon=self.params.WCA_epsilon.m_as("sim_energy"),  # Same scale as WCA
-                        cutoff=2.5 * sigma,
-                        shift="auto",
-                    )
-                else:
-                    # Remove LJ potential
-                    self.system.non_bonded_inter[type_0, type_1].lennard_jones.set_params(
-                        sigma=0,
-                        epsilon=0,
-                        cutoff=0,
-                        shift="auto",
-                    )
+        """Toggle the Lennard-Jones formation pair potential between agents only.
+
+        Formation is an agent<->agent interaction, so the LJ is set only on the single
+        (formation_type, formation_type) pair. Applying the attractive LJ tail to
+        agent<->cargo or cargo<->cargo would suck agents into the cargo, defeating the
+        purpose. Steric agent<->cargo repulsion is handled separately by the WCA set in
+        _setup_interactions and is left untouched here.
+        """
+        t = self.formation_type
+        prop = self.colloid_radius_register.get(t)
+        if prop is None:
+            return
+
+        if enabled:
+            # Add LJ potential between agents
+            sigma = (prop["radius"] + prop["radius"]) * 2 ** (-1 / 6)
+            self.system.non_bonded_inter[t, t].lennard_jones.set_params(
+                sigma=sigma,
+                epsilon=self.params.WCA_epsilon.m_as("sim_energy"),  # Same scale as WCA
+                cutoff=2.5 * sigma,
+                shift="auto",
+            )
+        else:
+            # Remove LJ potential
+            self.system.non_bonded_inter[t, t].lennard_jones.set_params(
+                sigma=0,
+                epsilon=0,
+                cutoff=0,
+                shift="auto",
+            )
 
     def _apply_angle_potential(self, enabled: bool):
         """
@@ -1467,49 +1540,55 @@ class EspressoMD(Engine):
         k_angle = 10.0            # Spring constant for angle potential
         phi_0 = np.pi / 2         # Equilibrium angle 90° (for V-shapes)
 
-        # Group colloids by type so that bonds only form within a type.
-        by_type: dict = {}
-        for col in self.colloids:
-            by_type.setdefault(col.type, []).append(col)
+        # Reuse a single AngleHarmonic bond type for every triplet. Creating a new
+        # one per triplet (and never removing it from system.bonded_inter on toggle
+        # off) leaked bond types into the global registry without bound, which
+        # ESPResSo walks every integration step -> progressively slower episodes.
+        if not hasattr(self, '_shared_angle_bond'):
+            self._shared_angle_bond = AngleHarmonic(bend=k_angle, phi0=phi_0)
+            self.system.bonded_inter.add(self._shared_angle_bond)
 
-        for type_members in by_type.values():
-            if len(type_members) < 3:
+        # Angle bonds form among agents (formation_type) only. Roping the cargo (or any
+        # other type) into a shape is both physically wrong and numerically unstable: a
+        # mixed-radius triplet has no reachable 90° rest state, so the harmonic torque
+        # diverges. (Other types are also excluded by the len < 3 guard when there is a
+        # single cargo, but the agent-only restriction makes the intent explicit.)
+        type_members = [c for c in self.colloids if c.type == self.formation_type]
+        if len(type_members) < 3:
+            return
+
+        for i, hub in enumerate(type_members):
+            pos_i = hub.pos
+            distances = []
+            for j, candidate in enumerate(type_members):
+                if i == j:
+                    continue
+                dist = np.linalg.norm(pos_i - candidate.pos)
+                if dist < distance_threshold:
+                    distances.append((dist, j))
+
+            distances.sort()
+            if len(distances) < 2:
                 continue
 
-            for i, hub in enumerate(type_members):
-                pos_i = hub.pos
-                distances = []
-                for j, candidate in enumerate(type_members):
-                    if i == j:
-                        continue
-                    dist = np.linalg.norm(pos_i - candidate.pos)
-                    if dist < distance_threshold:
-                        distances.append((dist, j))
+            _, idx_1 = distances[0]
+            _, idx_2 = distances[1]
+            neighbor_1 = type_members[idx_1]
+            neighbor_2 = type_members[idx_2]
 
-                distances.sort()
-                if len(distances) < 2:
-                    continue
+            bond_tuple = tuple(sorted([neighbor_1.id, hub.id, neighbor_2.id]))
 
-                _, idx_1 = distances[0]
-                _, idx_2 = distances[1]
-                neighbor_1 = type_members[idx_1]
-                neighbor_2 = type_members[idx_2]
+            if bond_tuple in self.active_angle_bonds:
+                continue
 
-                bond_tuple = tuple(sorted([neighbor_1.id, hub.id, neighbor_2.id]))
-
-                if bond_tuple in self.active_angle_bonds:
-                    continue
-
-                try:
-                    angle_bond = AngleHarmonic(bend=k_angle, phi0=phi_0)
-                    self.system.bonded_inter.add(angle_bond)
-                    neighbor_1.add_bond((angle_bond, hub.id, neighbor_2.id))
-                    self.active_angle_bonds.add(bond_tuple)
-                    logger.debug(
-                        f"Created angle bond: {neighbor_1.id}-{hub.id}-{neighbor_2.id}"
-                    )
-                except Exception as e:
-                    logger.warning(f"Failed to create angle bond: {e}")
+            try:
+                neighbor_1.add_bond((self._shared_angle_bond, hub.id, neighbor_2.id))
+                self.active_angle_bonds.add(bond_tuple)
+                logger.debug(
+                    f"Created angle bond: {neighbor_1.id}-{hub.id}-{neighbor_2.id}"
+                )
+            except Exception as e:
+                logger.warning(f"Failed to create angle bond: {e}")
 
     def _remove_all_angle_bonds(self):
         """
