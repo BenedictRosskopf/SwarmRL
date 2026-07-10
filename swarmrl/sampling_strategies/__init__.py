@@ -6,6 +6,7 @@ from swarmrl.sampling_strategies.categorical_distribution import CategoricalDist
 from swarmrl.sampling_strategies.gaussian_distribution import (
     ContinuousGaussianDistribution,
 )
+from swarmrl.sampling_strategies.greedy_distribution import GreedyDistribution
 from swarmrl.sampling_strategies.gumbel_distribution import GumbelDistribution
 from swarmrl.sampling_strategies.sampling_strategy import (
     ContinuousSamplingStrategy,
@@ -18,6 +19,7 @@ __all__ = [
     DiscreteSamplingStrategy.__name__,
     ContinuousSamplingStrategy.__name__,
     CategoricalDistribution.__name__,
+    GreedyDistribution.__name__,
     GumbelDistribution.__name__,
     ContinuousGaussianDistribution.__name__,
 ]

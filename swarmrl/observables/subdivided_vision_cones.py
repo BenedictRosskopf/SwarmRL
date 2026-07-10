@@ -29,6 +29,7 @@ class SubdividedVisionCones(Observable):
         radii: List[float],
         detected_types=None,
         particle_type: int = 0,
+        cone_offset: float = 0.0,
     ):
         """
         Constructor for the observable.
@@ -50,6 +51,13 @@ class SubdividedVisionCones(Observable):
                 if None then all will be detected.
         particle_type : int (default=0)
                 Particle type to compute the observable for.
+        cone_offset : float (default=0.0)
+                Angle (radians) by which the whole cone pattern is rotated about
+                the heading direction. With an even ``n_cones`` over a full 360°
+                field, the heading direction falls on the seam between two cones;
+                passing ``cone_offset = vision_half_angle / n_cones`` shifts the
+                pattern by half a cone width so one cone is centered on the
+                heading direction instead.
         """
         super().__init__(particle_type=particle_type)
         self.vision_range = vision_range
@@ -57,6 +65,7 @@ class SubdividedVisionCones(Observable):
         self.n_cones = n_cones
         self.radii = radii
         self.detected_types = detected_types
+        self.cone_offset = cone_offset
         self.angle_fn = jit(calc_signed_angle_between_directors)
         
         # Calculate observable shape (stored in _shape for the property)
@@ -149,6 +158,18 @@ class SubdividedVisionCones(Observable):
         # Get the singed angle between them
         # call the jax.jit version of calc_signed_angle_between_directors()
         angle = self.angle_fn(my_director, dist / dist_norm)
+
+        # rotate the cone pattern about the heading so cones can be centered on
+        # the heading direction (see cone_offset). For a full 360° field the
+        # binning is periodic, so wrap the offset angle back into
+        # [-vision_half_angle, vision_half_angle); otherwise the cone straddling
+        # the rear seam would lose part of its range and objects directly behind
+        # would fall into no cone. Wrapping is skipped for a partial field of
+        # view, where folding rear objects into the front cones would be wrong.
+        angle = angle + self.cone_offset
+        if self.vision_half_angle >= np.pi:
+            period = 2 * self.vision_half_angle
+            angle = (angle + self.vision_half_angle) % period - self.vision_half_angle
 
         # get masks with True if the colloid is in the specific vision cone
         rims = (
